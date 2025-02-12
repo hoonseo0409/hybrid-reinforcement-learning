@@ -10,6 +10,13 @@ This repository implements a hybrid reinforcement learning system for game autom
 - Combined value and Q-function learning
 - Behavioral cloning from human demonstrations
 
+## LLM Integration
+
+- Claude 3.5 Sonnet integration for complex scenario handling
+- Vision-language reasoning for uncertain states
+- Robust error recovery system
+- Rate-limited API calls with intelligent caching
+
 ## Model Architecture
 
 ### State Representation
