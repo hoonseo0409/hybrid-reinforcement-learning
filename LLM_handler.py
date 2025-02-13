@@ -17,6 +17,9 @@ import threading
 from datetime import datetime, timedelta
 import traceback
 
+from typing import List, Dict, Tuple
+from dataclasses import dataclass
+
 def if_current_keyboard_is_english():
     """
         Gets the keyboard language in use by the current
@@ -65,60 +68,149 @@ def get_agent_source_code(agent_type: str) -> str:
     with open(agent_path, 'r', encoding='utf-8') as f:
         return f.read()
 
-def handle_with_LLM(screenshot: np.ndarray, traceback: str, tr: int,
-                  agent_type: str, agent_pos: tuple, agent_size: tuple,
-                  eng_name: str, previous_code: Optional[str] = None,
-                  previous_result: Optional[dict] = None) -> Optional[str]:
+class ScreenEmbeddingModel:
+    """Template class for screen embedding model that converts sequence of frames to fixed-length vector"""
+    
+    def __init__(self, embedding_dim: int = 512):
+        """Initialize model
+        
+        Args:
+            embedding_dim: Dimension of output embedding vector
+        """
+        self.embedding_dim = embedding_dim
+        # Model weights and architecture will be implemented later
+        
+    def predict(self, screen_frames: List[np.ndarray]) -> np.ndarray:
+        """Convert sequence of frames into fixed dimension embedding
+        
+        Args:
+            screen_frames: List of screen frames as numpy arrays
+            
+        Returns:
+            embedding: Fixed length embedding vector as numpy array
+        """
+        # Actual implementation will come later
+        return np.zeros(self.embedding_dim)
+    
+@dataclass
+class ScenarioData:
+    """Container for scenario data including screens and explanation"""
+    screens: List[np.ndarray]
+    explanation: str
+    embedding: np.ndarray
+
+class RAGRetriever:
+    """Retrieves relevant scenarios using embedding similarity"""
+    
+    def __init__(self, 
+                 embedding_model: ScreenEmbeddingModel,
+                 scenarios: List[ScenarioData]):
+        """Initialize retriever
+        
+        Args:
+            embedding_model: Model to convert screens to embeddings
+            scenarios: List of available scenarios with screens and explanations
+        """
+        self.embedding_model = embedding_model
+        self.scenarios = scenarios
+        
+        # Stack all scenario embeddings into 2D array
+        self.embedding_matrix = np.stack([s.embedding for s in scenarios])
+        
+    def retrieve(self, 
+                query_screens: List[np.ndarray],
+                top_k: int = 1,
+                similarity_threshold: float = 0.7
+                ) -> List[ScenarioData]:
+        """Retrieve most relevant scenarios
+        
+        Args:
+            query_screens: List of query screen frames
+            top_k: Number of scenarios to retrieve
+            similarity_threshold: Minimum similarity score threshold
+            
+        Returns:
+            relevant_scenarios: List of most relevant scenarios
+        """
+        # Get embedding for query screens
+        query_embedding = self.embedding_model.predict(query_screens)
+        
+        # Calculate similarity scores with all scenarios
+        # Using dot product similarity
+        similarity_scores = np.dot(self.embedding_matrix, query_embedding)
+        
+        # Get indices of top K most similar scenarios above threshold
+        top_indices = np.argsort(similarity_scores)[-top_k:]
+        relevant_indices = [i for i in top_indices 
+                          if similarity_scores[i] >= similarity_threshold]
+        
+        # Return relevant scenarios
+        return [self.scenarios[i] for i in relevant_indices]
+
+def handle_with_LLM(screenshots: List[np.ndarray],
+                    traceback: str, 
+                    tr: int,
+                    agent_type: str,
+                    agent_pos: tuple,
+                    agent_size: tuple,  
+                    eng_name: str,
+                    rag_retriever: RAGRetriever,
+                    previous_code: Optional[str] = None,
+                    previous_result: Optional[dict] = None) -> Optional[str]:
     """
-    Generate error handling code using Claude API based on game screenshot and error traceback.
+    Generate error handling code using RAG-enhanced Claude API
     
     Args:
-        screenshot: Current game state screenshot
+        screenshots: List of recent game screenshots
         traceback: Error traceback string
-        tr: Current trial number
+        tr: Current trial number 
         agent_type: Type of agent
-        agent_pos: Position of agent window (x, y)
-        agent_size: Size of agent window (width, height)
-        eng_name: English name of agent for logging
-        previous_code: Previously generated code that failed (if any)
-        previous_result: Result from executing previous code (if any)
-    
+        agent_pos: Position of agent window
+        agent_size: Size of agent window
+        eng_name: English name of agent
+        rag_retriever: RAG retrieval system
+        previous_code: Previously generated code that failed
+        previous_result: Result from executing previous code
+        
     Returns:
-        String containing Python code to handle the error state, or None if API call skipped
+        Python code string to handle error state
     """
     # Check trial number
     if tr >= 5:
-        return None  # Skip LLM for later trials
-    utils.telegram_bot.send_message(secures.telegram_chat_id, f"{eng_name}: Trying to call Anthropic API...")
+        return None
+    utils.telegram_bot.send_message(secures.telegram_chat_id, 
+                                  f"{eng_name}: Trying to call Anthropic API...")
         
-    # Check and update API call tracking
+    # Check API rate limit
     current_time = datetime.now()
     with _api_call_lock:
-        # Remove calls older than 30 minutes
         cutoff_time = current_time - timedelta(minutes=30)
         _api_call_times[:] = [t for t in _api_call_times if t > cutoff_time]
         
-        # Check if we've hit the rate limit
         if len(_api_call_times) >= 15:
-            utils.telegram_bot.send_message(secures.telegram_chat_id, f"{eng_name}: Anthropic API rate limit reached (15 calls/30min)")
+            utils.telegram_bot.send_message(secures.telegram_chat_id,
+                f"{eng_name}: Anthropic API rate limit reached (15 calls/30min)")
             return None
             
-        # Add new call time and proceed
         _api_call_times.append(current_time)
 
-    # Convert screenshot to base64 for API
-    success, buffer = cv2.imencode('.png', screenshot)
+    # Retrieve relevant scenarios using RAG
+    relevant_scenarios = rag_retriever.retrieve(screenshots)
+    
+    # Convert current screenshots to base64
+    # Using most recent screenshot for LLM
+    success, buffer = cv2.imencode('.png', screenshots[-1])
     if not success:
         raise ValueError("Failed to encode screenshot")
     screenshot_b64 = base64.b64encode(buffer).decode('utf-8')
 
     # Get truncated agent source code
     agent_source = get_agent_source_code(agent_type)
-    agent_source_lines = agent_source.split('\n')[:1300]  # Take first 1300 lines
+    agent_source_lines = agent_source.split('\n')[:1300]
     agent_source_truncated = '\n'.join(agent_source_lines)
     
-    # System message with truncated source code and tools definition
-    system_message = f"""You are an expert at analyzing game screenshots and debugging automation systems. 
+    # System message with source code and tools
+    system_message = f"""You are an expert at analyzing game screenshots and debugging automation systems.
 Below is the first part of the source code of the Agent class you're working with:
 
 {agent_source_truncated}
@@ -126,7 +218,7 @@ Below is the first part of the source code of the Agent class you're working wit
 You have access to the following core functions:
 """
 
-    # Add tools definition separately to avoid nested formatting
+    # Add tools definition
     tools_definition = """
 <tools>
 [
@@ -134,7 +226,7 @@ You have access to the following core functions:
         "name": "click",
         "description": "Click the mouse at specified coordinates relative to game window's upper left corner",
         "parameters": {
-            "type": "object",
+            "type": "object", 
             "properties": {
                 "x": {"type": "integer", "description": "X coordinate relative to game window"},
                 "y": {"type": "integer", "description": "Y coordinate relative to game window"}
@@ -144,7 +236,7 @@ You have access to the following core functions:
     },
     {
         "name": "press_key",
-        "description": "Press a specified keyboard key", 
+        "description": "Press a specified keyboard key",
         "parameters": {
             "type": "object",
             "properties": {
@@ -164,7 +256,7 @@ When generating code to handle uncertain game states:
 
     system_message = system_message + tools_definition
 
-    # Build user prompt
+    # Build user prompt with RAG context
     prompt = f"""Help debug and handle an uncertain state in the game automation system.
 
 Current screenshot has been provided (base64 encoded PNG).
@@ -173,7 +265,15 @@ Error traceback:
 {traceback}
 
 The game window position is at pos = ({agent_pos[0]}, {agent_pos[1]}) and size is size = ({agent_size[0]}, {agent_size[1]}).
+"""
 
+    # Add RAG context if relevant scenarios found
+    if relevant_scenarios:
+        prompt += "\nRelevant previous scenarios:\n"
+        for i, scenario in enumerate(relevant_scenarios):
+            prompt += f"\nScenario {i+1}:\n{scenario.explanation}\n"
+
+    prompt += """
 Please analyze the screenshot and error and generate Python code to handle this uncertain state. Your code should:
 1. Use appropriate Agent methods to return the game to a stable state, such as ingame state.
 2. Include error handling and logging.
@@ -195,7 +295,7 @@ You have access to all Agent methods shown in the source code, plus utils, senso
             temperature=0.7,
             system=system_message,
             messages=[{
-                "role": "user", 
+                "role": "user",
                 "content": [
                     {
                         "type": "text",
@@ -212,11 +312,11 @@ You have access to all Agent methods shown in the source code, plus utils, senso
                 ]
             }])
 
-        # Extract code from Claude's response
+        # Extract code from response
         response = message.content[0].text
-        utils.telegram_bot.send_message(secures.telegram_chat_id, f"{eng_name}: LLM message received: {response}")
+        utils.telegram_bot.send_message(secures.telegram_chat_id, 
+                                      f"{eng_name}: LLM message received: {response}")
         
-        # Find code block in response
         code_start = response.find("```python")
         code_end = response.find("```", code_start + 8)
         
@@ -225,7 +325,7 @@ You have access to all Agent methods shown in the source code, plus utils, senso
             
         code = response[code_start + 8:code_end].strip()
         
-        # Basic security checks
+        # Security checks
         forbidden_terms = [
             "import os", "import sys", "subprocess", "exec(", "eval(",
             "open(", "__import__", "system(", "popen("
@@ -238,7 +338,8 @@ You have access to all Agent methods shown in the source code, plus utils, senso
         return code
 
     except Exception as e:
-        utils.telegram_bot.send_message(secures.telegram_chat_id, f"{eng_name}: Anthropic API rate limit reached (15 calls/30min)")(f"{eng_name}: LLM API call failed: {str(e)}")
+        utils.telegram_bot.send_message(secures.telegram_chat_id,
+            f"{eng_name}: LLM API call failed: {str(e)}")
         return None
 
 def handle_error_state(agent, code: str) -> dict:
