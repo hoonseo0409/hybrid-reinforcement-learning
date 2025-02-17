@@ -417,6 +417,58 @@ class HybridGameAutomationRL:
             'log_probs': []
         }
 
+    def save(self, save_path: str):
+        """Save model weights and configuration"""
+        # Create save directory if it doesn't exist
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        
+        # Save individual networks using Keras save
+        self.policy.save_weights(f"{save_path}_policy")
+        self.value_net.save_weights(f"{save_path}_value")
+        self.q_net.save_weights(f"{save_path}_q")
+        
+        # Save configuration
+        config = {
+            'action_space': self.action_space,
+            'learning_rate': float(self.value_optimizer.learning_rate.numpy()),
+            'gamma': self.gamma,
+            'gae_lambda': self.gae_lambda,
+            'clip_ratio': self.clip_ratio,
+            'bc_weight': self.bc_weight,
+            'value_weight': self.value_weight,
+            'batch_size': self.batch_size
+        }
+        
+        with open(f"{save_path}_config.json", 'w') as f:
+            json.dump(config, f)
+    
+    def load(self, load_path: str):
+        """Load model weights and configuration"""
+        # Load network weights using Keras load
+        self.policy.load_weights(f"{load_path}_policy")
+        self.value_net.load_weights(f"{load_path}_value")
+        self.q_net.load_weights(f"{load_path}_q")
+        
+        # Load configuration
+        with open(f"{load_path}_config.json", 'r') as f:
+            config = json.load(f)
+            
+        # Update configuration
+        self.action_space = config['action_space']
+        self.gamma = config['gamma']
+        self.gae_lambda = config['gae_lambda']
+        self.clip_ratio = config['clip_ratio']
+        self.bc_weight = config['bc_weight']
+        self.value_weight = config['value_weight']
+        self.batch_size = config['batch_size']
+        
+        # Update optimizers learning rate
+        lr = config['learning_rate']
+        self.value_optimizer.learning_rate.assign(lr)
+        self.q_optimizer.learning_rate.assign(lr)
+        self.policy_optimizer.learning_rate.assign(lr)
+        self.bc_optimizer.learning_rate.assign(lr)
+    
     def _execute_action(self, worker, action, lock_here=True):
         """Execute action in game environment"""
         with self.worker_lock if lock_here else ExitStack() as workerlock:
@@ -780,7 +832,7 @@ class HybridGameAutomationRL:
         action_vec.extend(key_presses)
 
         # Ensure vector has correct length
-        expected_length = 34
+        expected_length = self.action_dim
         if len(action_vec) < expected_length:
             action_vec.extend([0.0] * (expected_length - len(action_vec)))
         elif len(action_vec) > expected_length:
@@ -1227,24 +1279,27 @@ class HybridGameAutomationRL:
         return action
 
 def train_rl_model(agent,
-                         demo_dir: str,
-                         action_space: Dict,
-                         worker,
-                         reward_function,
-                         worker_lock,
-                         num_demo_epochs: int = 50,
-                         num_episodes: int = 100,
-                         save_dir: str = "model"):
-    """Train hybrid model using both demonstrations and gameplay"""
+                  demo_dir: str, 
+                  action_space: Dict,
+                  worker,
+                  reward_function,
+                  worker_lock,
+                  num_demo_epochs: int = 50,
+                  save_dir: str = None):
+    """Train RL model using demonstrations and save it"""
     
-    # Initialize state processor
+    if save_dir is None:
+        save_dir = f"./syncing/RL/models/{agent.gtype}"
+        
+    os.makedirs(save_dir, exist_ok=True)
+    
+    # Initialize state processor and model
     state_processor = GameStateProcessor(
         agent=agent,
         target_size=(84, 84),
         sequence_length=4
     )
     
-    # Create model
     model = HybridGameAutomationRL(
         agent=agent,
         state_processor=state_processor,
@@ -1253,16 +1308,13 @@ def train_rl_model(agent,
         worker_lock=worker_lock,
     )
     
-    # First train on demonstrations
+    # Train on demonstrations only
     print("Training on demonstrations...")
     model.train_on_demonstrations(demo_dir, num_epochs=num_demo_epochs)
     
-    # Then train through gameplay
-    print("Training through gameplay...")
-    model.train_from_gameplay(worker, num_episodes)
-    
-    # Save trained model
-    model.save_model(save_dir)
+    # Save model after demonstration training
+    model.save(os.path.join(save_dir, f"{agent.gtype}_model"))
+    print("Finished training on demonstrations...")
     
     return model
 
@@ -1526,3 +1578,95 @@ def record_gameplay(agent, action_space, save_dir="recordings", capt_interval=1.
     recorder.start_recording()
     
     return recorder
+
+class RLGameplayController:
+    """Controls RL-based gameplay sessions"""
+    
+    def __init__(self, 
+                 agent,
+                 action_space: Dict,
+                 reward_function,
+                 end_condition,
+                 action_threshold: float = 0.7,
+                 agent_action_condition = None):
+        
+        self.agent = agent
+        self.action_space = action_space
+        self.reward_function = reward_function
+        self.end_condition = end_condition
+        self.action_threshold = action_threshold
+        self.agent_action_condition = agent_action_condition
+        
+        # Load saved model
+        self.model = self._load_model()
+        self.state_processor = GameStateProcessor(agent=agent)
+        
+    def _load_model(self):
+        """Load saved model for agent's game type"""
+        model_path = f"./syncing/RL/models/{self.agent.gtype}/{self.agent.gtype}_model"
+        
+        # Initialize model
+        model = HybridGameAutomationRL(
+            agent=self.agent,
+            state_processor=GameStateProcessor(self.agent),
+            action_space=self.action_space,
+            reward_function=self.reward_function,
+            worker_lock=self.agent.worker_lock
+        )
+        
+        # Load weights
+        model.load(model_path)
+        return model
+        
+    def run_gameplay(self):
+        """Run RL-controlled gameplay session"""
+        state = self.state_processor.get_initial_state()
+        episode_reward = 0
+        
+        while not self.end_condition(state):
+            # Check if agent should handle this state
+            agent_action = self.agent_action_condition(state)
+            if agent_action is not False:
+                # Let agent handle this state
+                agent_action(self.agent)
+                continue
+                
+            # Sample action from RL policy
+            action, outputs = self.model.select_action(state)
+            
+            # Check action confidence
+            if max(outputs['action_probs'][0]) < self.action_threshold:
+                # Take null action
+                action['type'] = 3
+                action['mouse_pos'] = None
+                action['key_presses'] = None
+            
+            # Execute action
+            self.model._execute_action(self.agent.worker, action)
+            
+            # Get next state and reward
+            next_frame = self.state_processor.capture_frame()
+            next_state = self.state_processor.process_frame(next_frame)
+            reward = self.reward_function.calculate_reward(
+                next_frame, state, action
+            )
+            episode_reward += reward
+            
+            # Store transition and train
+            self.model._store_transition(
+                state, action, reward, next_state,
+                outputs['action_probs']
+            )
+            
+            if len(self.model.online_buffer['states']) >= self.model.batch_size:
+                self.model.train_iteration(
+                    self.model._sample_demonstration_batch([]),
+                    self.model._get_online_batch()
+                )
+            
+            state = next_state
+            
+        # Save updated model
+        self.model.save(f"./syncing/RL/models/{self.agent.gtype}/{self.agent.gtype}_model")
+        
+        return episode_reward
