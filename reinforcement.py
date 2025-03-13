@@ -1,27 +1,29 @@
+import secures
 import tensorflow as tf
 import numpy as np
 from typing import Dict, List, Optional, Tuple
 import os
 import json
 from collections import deque
-import cv2
 
 import time
 from datetime import datetime
 from threading import Thread
-from pynput import mouse, keyboard
 import utils
 
+if not secures.if_remote_work:
+    from pynput import mouse, keyboard
+    import cv2
 from contextlib import ExitStack
 
 class GameStateProcessor:
     """Handles game state processing and management for RL"""
     
     def __init__(self, 
-                 agent,
+                 agent = None,
                  target_size: Tuple[int, int] = (84, 84),
                  sequence_length: int = 4,
-                 grayscale: bool = True):
+                 grayscale: bool = False):
         """
         Initialize state processor
         
@@ -202,6 +204,7 @@ class HybridPolicyNetwork(tf.keras.Model):
         }
 
         self.action_space = action_space
+        self.state_shape = state_shape
         
         # State dimensions
         self.state_dim = state_shape[0] * state_shape[1] * state_shape[2] * state_shape[3]
@@ -306,10 +309,10 @@ class HybridPolicyNetwork(tf.keras.Model):
         action = state_action_input[:, state_dim:]
 
         # Reshape state for feature extraction
-        seq_length = 4
-        h = w = 84
-        c = 1
-        reshaped_state = tf.reshape(state, [batch_size, seq_length, h, w, c])
+        # seq_length = 4
+        # h = w = 84
+        # c = 1
+        reshaped_state = tf.reshape(state, [batch_size, self.state_shape[0], self.state_shape[1], self.state_shape[2], self.state_shape[3]])
 
         # Extract features
         features = self.extract_features(reshaped_state)
@@ -331,11 +334,11 @@ class HybridGameAutomationRL:
     """Complete hybrid RL implementation with unified value learning"""
     
     def __init__(self,
-                agent,
                 state_processor,
                 action_space: Dict,
                 reward_function,
-                worker_lock,
+                worker_lock = None,
+                agent = None,
                 learning_rate=0.0001,
                 gamma=0.99,
                 gae_lambda=0.95,
@@ -520,7 +523,7 @@ class HybridGameAutomationRL:
                         
                 for key in pressed_keys:
                     self.agent.bring_window_forward()
-                    worker.press(
+                    worker.tab_key(
                         key=key,
                         if_special_key='Key.' in key
                     )
@@ -1177,6 +1180,10 @@ class HybridGameAutomationRL:
         # Load demonstrations
         self.demonstrations = self._load_demonstrations(demo_dir)
         
+        if len(self.demonstrations) == 0:
+            raise ValueError("No demonstrations found.")
+        else:
+            print(f"Replay data loaded: self.demonstrations[0]: {self.demonstrations[0]}")
         # Initial dummy pass to build model
         dummy_batch = self._sample_demonstration_batch(self.demonstrations)
         _ = self._behavioral_cloning_step(dummy_batch)
@@ -1278,25 +1285,28 @@ class HybridGameAutomationRL:
             
         return action
 
-def train_rl_model(agent,
+def train_rl_model(
                   demo_dir: str, 
                   action_space: Dict,
-                  worker,
                   reward_function,
-                  worker_lock,
+                  gtype,
+                  target_size, 
+                  agent = None,
+                  worker = None,
+                  worker_lock = None,
                   num_demo_epochs: int = 50,
                   save_dir: str = None):
     """Train RL model using demonstrations and save it"""
     
     if save_dir is None:
-        save_dir = f"./syncing/RL/models/{agent.gtype}"
+        save_dir = os.path.join(".", "syncing", "RL", "models", gtype)
         
     os.makedirs(save_dir, exist_ok=True)
     
     # Initialize state processor and model
     state_processor = GameStateProcessor(
         agent=agent,
-        target_size=(84, 84),
+        target_size=target_size,
         sequence_length=4
     )
     
@@ -1588,7 +1598,8 @@ class RLGameplayController:
                  reward_function,
                  end_condition,
                  action_threshold: float = 0.7,
-                 agent_action_condition = None):
+                 agent_action_condition = None,
+                 list_disallowed_xyxy = None):
         
         self.agent = agent
         self.action_space = action_space
@@ -1596,6 +1607,8 @@ class RLGameplayController:
         self.end_condition = end_condition
         self.action_threshold = action_threshold
         self.agent_action_condition = agent_action_condition
+        if list_disallowed_xyxy is None: self.list_disallowed_xyxy = []
+        else: self.list_disallowed_xyxy = list_disallowed_xyxy
         
         # Load saved model
         self.model = self._load_model()
@@ -1603,7 +1616,7 @@ class RLGameplayController:
         
     def _load_model(self):
         """Load saved model for agent's game type"""
-        model_path = f"./syncing/RL/models/{self.agent.gtype}/{self.agent.gtype}_model"
+        model_path = os.path.join(".", "syncing", "RL", "models", self.agent.gtype, f"{self.agent.gtype}_model")
         
         # Initialize model
         model = HybridGameAutomationRL(
@@ -1667,6 +1680,6 @@ class RLGameplayController:
             state = next_state
             
         # Save updated model
-        self.model.save(f"./syncing/RL/models/{self.agent.gtype}/{self.agent.gtype}_model")
+        self.model.save(os.path.join(".", "syncing", "RL", "models", self.agent.gtype, f"{self.agent.gtype}_model"))
         
         return episode_reward
